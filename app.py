@@ -11,7 +11,7 @@ import yfinance as yf
 
 TZ = ZoneInfo('Asia/Taipei')
 st.set_page_config(page_title='台股全市場 60 分 KD', layout='wide')
-st.title('台股全市場 60 分 KD 選股器')
+st.title('台股全市場 60 分 KD 選股器 V1.4')
 st.caption('實驗版｜上市＋上櫃普通股｜KD(9,3,3)｜Yahoo 60m 行情，非保證即時')
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -53,20 +53,18 @@ def kd(frame):
         ks.append(k); ds.append(d)
     return pd.DataFrame({'K':ks,'D':ds}, index=frame.index)
 
-def classify(ind):
+def is_new_cross(ind):
+    """Only the latest completed bar may trigger an A signal."""
+    if len(ind) < 20:
+        return False
     k, d = ind['K'], ind['D']
-    if len(ind) < 20 or not (k.iloc[-1] < 20 and k.iloc[-1] > d.iloc[-1]):
-        return None
-    cross = (k.shift(1) <= d.shift(1)) & (k > d) & (k < 20)
-    if bool(cross.iloc[-1]):
-        return 'A 新黃金交叉'
-    prior = np.flatnonzero(cross.to_numpy()[:-1])
-    if not len(prior):
-        return None
-    i = int(prior[-1])
-    if (k.iloc[i+1:] <= d.iloc[i+1:]).any():
-        return None
-    return 'B 交叉後低檔'
+    return bool(
+        pd.notna(k.iloc[-1]) and pd.notna(d.iloc[-1])
+        and pd.notna(k.iloc[-2]) and pd.notna(d.iloc[-2])
+        and k.iloc[-1] < 20
+        and k.iloc[-2] <= d.iloc[-2]
+        and k.iloc[-1] > d.iloc[-1]
+    )
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_batch(tickers):
@@ -122,6 +120,9 @@ if not universe:
 
 st.write(f'目前取得 **{len(universe):,}** 檔普通股代號（依官方公司清單的四位數代號篩選）')
 include_partial = st.checkbox('包含尚未收完的最新 60 分 K（訊號可能消失）', value=False)
+use_slope = st.checkbox('啟用 K 值增量門檻', value=True)
+min_slope = st.number_input('K 值至少上升（每根 60 分 K）', min_value=0.0, max_value=100.0, value=2.0, step=0.5, disabled=not use_slope)
+st.caption('K 值增量 = 最新完成 K 值 − 前一根 K 值；關閉門檻後仍按增量由大到小排序。')
 limit = st.selectbox('本次掃描範圍', ['全市場', '先測試 30 檔', '先測試 100 檔'])
 st.caption('全市場首次掃描可能需數分鐘以上；免費 Yahoo 來源可能限流，結果一定要看成功率。')
 
@@ -141,13 +142,15 @@ if st.button('開始掃描', type='primary'):
                 if len(df) < 25:
                     raise ValueError('60 分 K 資料不足或下載失敗')
                 ind = kd(df)
-                signal = classify(ind)
-                if signal:
-                    rows.append({'分類':signal, '代號':item['代號'], '名稱':item['名稱'],
-                                 '市場':item['市場'], 'K':round(float(ind.K.iloc[-1]),2),
-                                 'D':round(float(ind.D.iloc[-1]),2),
-                                 '收盤價':round(float(df.Close.iloc[-1]),2),
-                                 '資料最後時間':str(df.index[-1])})
+                if is_new_cross(ind):
+                    slope = float(ind['K'].iloc[-1] - ind['K'].iloc[-2])
+                    if not use_slope or slope >= min_slope:
+                        rows.append({'代號':item['代號'], '名稱':item['名稱'],
+                                     '市場':item['市場'], 'K值增量':round(slope, 2),
+                                     'K':round(float(ind['K'].iloc[-1]),2),
+                                     'D':round(float(ind['D'].iloc[-1]),2),
+                                     '收盤價':round(float(df['Close'].iloc[-1]),2),
+                                     '訊號K棒時間':str(df.index[-1])})
             except Exception as exc:
                 failures.append({'股票':ticker, '原因':str(exc)[:120] or error})
         done = min(start+len(group), len(selected))
@@ -159,13 +162,15 @@ if st.button('開始掃描', type='primary'):
     st.success(f'掃描結束｜成功 {success:,}/{len(selected):,}（{success/len(selected):.1%}）｜失敗 {len(failures):,}')
     if roster_errors or failures:
         st.warning('資料未完整覆蓋全市場；未掃描成功的股票不能視為不符合條件。')
-    for label in ('A 新黃金交叉', 'B 交叉後低檔'):
-        sub = pd.DataFrame([x for x in rows if x['分類']==label])
-        st.subheader(f'{label}：{len(sub)} 檔')
-        st.dataframe(sub, hide_index=True, use_container_width=True)
-    if rows:
-        st.download_button('下載符合條件 CSV', pd.DataFrame(rows).to_csv(index=False).encode('utf-8-sig'),
-                           'kd60_full_market.csv', mime='text/csv')
+    results = pd.DataFrame(rows)
+    st.subheader(f'A 新黃金交叉（符合目前斜率設定）：{len(results)} 檔')
+    if not results.empty:
+        results = results.sort_values('K值增量', ascending=False, kind='stable').reset_index(drop=True)
+        st.dataframe(results, hide_index=True, use_container_width=True)
+        st.download_button('下載符合條件 CSV', results.to_csv(index=False).encode('utf-8-sig'),
+                           'kd60_A_new_cross_slope.csv', mime='text/csv')
+    else:
+        st.info('本次成功取得行情的股票中，沒有符合目前條件的 A 類訊號。')
     if failures:
         with st.expander(f'查看失敗股票（{len(failures)} 檔）'):
             st.dataframe(pd.DataFrame(failures), hide_index=True)
