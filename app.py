@@ -11,8 +11,8 @@ import yfinance as yf
 
 TZ = ZoneInfo('Asia/Taipei')
 st.set_page_config(page_title='台股全市場 60 分 KD', layout='wide')
-st.title('台股全市場 60 分 KD 選股器 V1.5.1')
-st.caption('上市＋上櫃普通股｜KD(9,3,3)｜最新 60 分 K 黃金交叉｜產業分類｜Yahoo 行情非保證即時')
+st.title('台股全市場 60 分 KD 選股器 V1.5.2')
+st.caption('上市＋上櫃普通股｜KD(9,3,3)｜最新 60 分 K 黃金交叉｜官方產業分類雙來源補全｜Yahoo 行情非保證即時')
 
 
 def first_field(item, keys, default=''):
@@ -30,7 +30,7 @@ INDUSTRY_NAMES = {
     '05': '電機機械', '06': '電器電纜', '08': '玻璃陶瓷', '09': '造紙工業',
     '10': '鋼鐵工業', '11': '橡膠工業', '12': '汽車工業', '14': '建材營造',
     '15': '航運業', '16': '觀光餐旅', '17': '金融保險', '18': '貿易百貨',
-    '20': '其他業', '21': '化學工業', '22': '生技醫療', '23': '油電燃氣',
+    '19': '綜合', '20': '其他業', '21': '化學工業', '22': '生技醫療', '23': '油電燃氣',
     '24': '半導體', '25': '電腦及週邊設備', '26': '光電', '27': '通信網路',
     '28': '電子零組件', '29': '電子通路', '30': '資訊服務', '31': '其他電子',
     '32': '文化創意', '33': '農業科技', '34': '電子商務', '35': '綠能環保',
@@ -39,22 +39,31 @@ INDUSTRY_NAMES = {
 
 
 def industry_name(value):
+    """保留不明的官方原始值，避免誤當作已辨識產業。"""
     raw = str(value).strip()
-    if not raw or raw.lower() in ('nan', 'none', 'null'):
+    if not raw or raw.lower() in ('nan', 'none', 'null', '未分類', '--', '-'):
         return '未分類'
     if re.fullmatch(r'\d+(?:\.0+)?', raw):
         code = str(int(float(raw))).zfill(2)
-        return INDUSTRY_NAMES.get(code, f'未分類（{code}）')
+        return INDUSTRY_NAMES.get(code, f'未分類（代碼 {code}）')
     return raw
 
 
+def has_industry(value):
+    return bool(value and not str(value).startswith('未分類'))
+
+
+# 公司清單不同端點可能存在缺漏；以股票代號合併，優先使用有產業的資料。
+# 不自行依公司名稱猜產業，避免將生技、科技供應鏈錯誤歸類。
 @st.cache_data(ttl=86400, show_spinner=False)
 def roster():
     sources = [
         ('上市', 'https://openapi.twse.com.tw/v1/opendata/t187ap03_L', '.TW'),
         ('上櫃', 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O', '.TWO'),
+        ('上櫃', 'https://openapi.twse.com.tw/v1/opendata/t187ap03_O', '.TWO'),
     ]
-    out, errors = [], []
+    out, errors = {}, []
+    successful_markets = set()
     for market, url, suffix in sources:
         try:
             response = requests.get(url, timeout=25, headers={'User-Agent': 'Mozilla/5.0'})
@@ -65,18 +74,32 @@ def roster():
             count = 0
             for item in payload:
                 code = first_field(item, ('公司代號', 'SecuritiesCompanyCode', 'CompanyCode', 'Code'))
+                if not re.fullmatch(r'\d{4}', code):
+                    continue
                 name = first_field(item, ('公司簡稱', '公司名稱', 'CompanyName', 'SecuritiesCompanyName', 'Name'), code)
-                industry = industry_name(first_field(item, ('產業別', '產業類別', '產業名稱', 'Industry', 'IndustryName', 'IndustryCategory'), '未分類'))
-                if re.fullmatch(r'\d{4}', code):
-                    out.append({'代號': code, '名稱': name, '市場': market,
-                                '產業': industry, 'ticker': code + suffix})
-                    count += 1
+                industry_raw = first_field(item, ('產業名稱', '產業類別', '產業別', 'IndustryName', 'IndustryCategory', 'Industry'), '')
+                industry = industry_name(industry_raw)
+                ticker = code + suffix
+                new_item = {'代號': code, '名稱': name, '市場': market,
+                            '產業': industry, 'ticker': ticker}
+                old_item = out.get(ticker)
+                if old_item is None:
+                    out[ticker] = new_item
+                elif has_industry(industry) and not has_industry(old_item['產業']):
+                    # 保留原本簡稱；補上另一官方來源較完整的產業資訊。
+                    old_item['產業'] = industry
+                count += 1
             if count < 100:
                 raise ValueError(f'僅解析出 {count} 檔，需確認 API 欄位')
+            successful_markets.add(market)
         except Exception as exc:
-            errors.append(f'{market}清單失敗：{exc}')
-    unique = {x['ticker']: x for x in out}
-    return list(unique.values()), errors
+            # 備援來源失敗時，若主要來源成功，仍可繼續運作。
+            errors.append(f'{market}來源 {url} 讀取失敗：{exc}')
+    for market in ('上市', '上櫃'):
+        if market not in successful_markets:
+            errors.append(f'{market}公司清單無有效來源')
+    return list(out.values()), errors
+
 
 
 def kd(frame):
@@ -212,6 +235,10 @@ if 'kd_results' in st.session_state:
         st.warning('資料未完整覆蓋全市場；未掃描成功的股票不能視為不符合條件。')
     st.subheader(f'A 新黃金交叉：{len(results)} 檔')
     if not results.empty:
+        missing_industry = results['產業'].astype(str).str.startswith('未分類').sum()
+        if missing_industry:
+            st.caption(f'其中 {missing_industry} 檔官方產業仍無法辨識，保留為未分類，不自行猜測。')
+    if not results.empty:
         sectors = sorted(results['產業'].fillna('未分類').unique().tolist())
         chosen = st.multiselect('依產業查看結果（可複選）', sectors,
                                 default=sectors, placeholder='選擇產業', key='kd_sector_filter')
@@ -220,7 +247,7 @@ if 'kd_results' in st.session_state:
         st.caption(f'目前顯示 {len(filtered)} / {len(results)} 檔；產業依證交所／櫃買中心公司基本資料分類。切換產業不需要重新掃描。')
         st.dataframe(filtered[['代號', '名稱', '市場', '產業', 'K值增量', 'K', 'D', '收盤價', '訊號K棒時間']], hide_index=True, use_container_width=True)
         st.download_button('下載目前顯示的 CSV', filtered.to_csv(index=False).encode('utf-8-sig'),
-                           'kd60_V1_5_results.csv', mime='text/csv')
+                           'kd60_V1_5_2_results.csv', mime='text/csv')
     else:
         st.info('本次成功取得行情的股票中，沒有符合目前條件的 A 類訊號。')
     if not failures.empty:
