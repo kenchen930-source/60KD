@@ -11,7 +11,7 @@ import yfinance as yf
 
 TZ = ZoneInfo('Asia/Taipei')
 st.set_page_config(page_title='台股全市場 60 分 KD', layout='wide')
-st.title('台股全市場 60 分 KD 選股器 V1.5')
+st.title('台股全市場 60 分 KD 選股器 V1.5.1')
 st.caption('上市＋上櫃普通股｜KD(9,3,3)｜最新 60 分 K 黃金交叉｜產業分類｜Yahoo 行情非保證即時')
 
 
@@ -21,6 +21,31 @@ def first_field(item, keys, default=''):
         if value is not None and str(value).strip():
             return str(value).strip()
     return default
+
+
+# TWSE/TPEx 官方「產業別」欄位有時回傳數字代碼，統一轉成中文產業名稱。
+# 未收錄代碼保留原始值，避免錯誤歸類。
+INDUSTRY_NAMES = {
+    '01': '水泥工業', '02': '食品工業', '03': '塑膠工業', '04': '紡織纖維',
+    '05': '電機機械', '06': '電器電纜', '08': '玻璃陶瓷', '09': '造紙工業',
+    '10': '鋼鐵工業', '11': '橡膠工業', '12': '汽車工業', '14': '建材營造',
+    '15': '航運業', '16': '觀光餐旅', '17': '金融保險', '18': '貿易百貨',
+    '20': '其他業', '21': '化學工業', '22': '生技醫療', '23': '油電燃氣',
+    '24': '半導體', '25': '電腦及週邊設備', '26': '光電', '27': '通信網路',
+    '28': '電子零組件', '29': '電子通路', '30': '資訊服務', '31': '其他電子',
+    '32': '文化創意', '33': '農業科技', '34': '電子商務', '35': '綠能環保',
+    '36': '數位雲端', '37': '運動休閒', '38': '居家生活',
+}
+
+
+def industry_name(value):
+    raw = str(value).strip()
+    if not raw or raw.lower() in ('nan', 'none', 'null'):
+        return '未分類'
+    if re.fullmatch(r'\d+(?:\.0+)?', raw):
+        code = str(int(float(raw))).zfill(2)
+        return INDUSTRY_NAMES.get(code, f'未分類（{code}）')
+    return raw
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -41,7 +66,7 @@ def roster():
             for item in payload:
                 code = first_field(item, ('公司代號', 'SecuritiesCompanyCode', 'CompanyCode', 'Code'))
                 name = first_field(item, ('公司簡稱', '公司名稱', 'CompanyName', 'SecuritiesCompanyName', 'Name'), code)
-                industry = first_field(item, ('產業別', '產業類別', '產業名稱', 'Industry', 'IndustryName', 'IndustryCategory'), '未分類')
+                industry = industry_name(first_field(item, ('產業別', '產業類別', '產業名稱', 'Industry', 'IndustryName', 'IndustryCategory'), '未分類'))
                 if re.fullmatch(r'\d{4}', code):
                     out.append({'代號': code, '名稱': name, '市場': market,
                                 '產業': industry, 'ticker': code + suffix})
@@ -139,6 +164,7 @@ limit = st.selectbox('本次掃描範圍', ['全市場', '先測試 30 檔', '�
 st.caption('全市場首次掃描可能需數分鐘以上；免費 Yahoo 來源可能限流，結果一定要看成功率。')
 
 if st.button('開始掃描', type='primary'):
+    st.session_state.pop('kd_sector_filter', None)
     selected = universe if limit == '全市場' else universe[:30 if '30' in limit else 100]
     rows, failures = [], []
     bar = st.progress(0)
@@ -187,12 +213,12 @@ if 'kd_results' in st.session_state:
     st.subheader(f'A 新黃金交叉：{len(results)} 檔')
     if not results.empty:
         sectors = sorted(results['產業'].fillna('未分類').unique().tolist())
-        chosen = st.multiselect('結果依產業篩選（可多選；不選表示全部）', sectors,
-                                default=[], placeholder='全部產業')
-        filtered = results[results['產業'].isin(chosen)] if chosen else results
+        chosen = st.multiselect('依產業查看結果（可複選）', sectors,
+                                default=sectors, placeholder='選擇產業', key='kd_sector_filter')
+        filtered = results[results['產業'].isin(chosen)]
         filtered = filtered.sort_values('K值增量', ascending=False, kind='stable').reset_index(drop=True)
-        st.caption(f'目前顯示 {len(filtered)} / {len(results)} 檔；切換產業不需要重新掃描。')
-        st.dataframe(filtered, hide_index=True, use_container_width=True)
+        st.caption(f'目前顯示 {len(filtered)} / {len(results)} 檔；產業依證交所／櫃買中心公司基本資料分類。切換產業不需要重新掃描。')
+        st.dataframe(filtered[['代號', '名稱', '市場', '產業', 'K值增量', 'K', 'D', '收盤價', '訊號K棒時間']], hide_index=True, use_container_width=True)
         st.download_button('下載目前顯示的 CSV', filtered.to_csv(index=False).encode('utf-8-sig'),
                            'kd60_V1_5_results.csv', mime='text/csv')
     else:
